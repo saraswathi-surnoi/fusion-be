@@ -1,0 +1,211 @@
+pipeline {
+    agent any
+    options {
+        timeout(time: 30, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        timestamps()
+    }
+    parameters {
+        booleanParam(name: 'SKIP_QUALITY_CHECKS', defaultValue: false, description: 'Skip all Quality Checks (Tests, OWASP, SAST, SonarQube)')
+    }
+    tools {
+        maven 'maven-3.9.8'
+    }
+    environment {
+        TEAMS_WEBHOOK     = "" // recommended: inject from credentials 'teams-webhook'
+        APP_VERSION       = "" // will be dynamically set from pom.xml
+        DOCKER_IMAGE      = "" // will be dynamically set from pom.xml
+        CONTAINER_NAME    = "" // same as DOCKER_IMAGE
+    }
+    stages {
+        stage('Checkout Source Code') {
+            steps {
+                git credentialsId: 'git-access', url: 'https://github.com/SurnoiTechnology/API-Gateway-Service-FusionIQ-BE.git'
+            }
+        }
+        stage('Read pom.xml') {
+            steps {
+                script {
+                    try {
+                        env.APP_VERSION = sh(script: "mvn help:evaluate -Dexpression=project.version -q -DforceStdout", returnStdout: true).trim()
+                        env.DOCKER_IMAGE = sh(script: "mvn help:evaluate -Dexpression=project.artifactId -q -DforceStdout", returnStdout: true).trim()
+                        env.CONTAINER_NAME = env.DOCKER_IMAGE
+
+                        echo "Java project version: ${env.APP_VERSION}"
+                        echo "Docker image name: ${env.DOCKER_IMAGE}"
+                        echo "Container name: ${env.CONTAINER_NAME}"
+                    } catch (err) {
+                        error("Could not read metadata from pom.xml")
+                    }
+                }
+            }
+        }
+        stage('Quality Checks') {
+            when { expression { return !params.SKIP_QUALITY_CHECKS } }
+            parallel {
+                stage('SAST Scan') {
+                    steps {
+                        echo "Running Static Application Security Testing..."
+                        sh "echo 'SAST scan complete (placeholder)'"
+                    }
+                }
+                stage('Run Unit Tests') {
+                    steps {
+                        echo "Running unit tests..."
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                            sh 'mvn test -B -Dmaven.test.failure.ignore=true'
+                        }
+                    }
+                }
+                stage('Security Scan (OWASP)') {
+                    steps {
+                        echo "Checking dependencies for vulnerabilities..."
+                        sh """
+                            mvn org.owasp:dependency-check-maven:check \
+                                -Dformat=ALL \
+                                -DoutputDirectory=target -B || true
+                        """
+                    }
+                    post {
+                        always {
+                            archiveArtifacts artifacts: 'target/dependency-check-report.*', allowEmptyArchive: true
+                            publishHTML(target: [
+                                reportDir: 'target',
+                                reportFiles: 'dependency-check-report.html',
+                                reportName: 'OWASP Dependency Report'
+                            ])
+                        }
+                    }
+                }
+                stage('Sonar Scan') {
+                    environment {
+                        scannerHome = tool 'sonar-7.2'
+                    }
+                    steps {
+                        script {
+                            withSonarQubeEnv('SonarQube-Server') {
+                                withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
+                                    sh """
+                                        ${scannerHome}/bin/sonar-scanner \
+                                            -Dsonar.token=${SONAR_TOKEN} \
+                                            -Dproject.settings=sonar-project.properties
+                                    """
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        stage('Quality Gate Check') {
+            when { expression { return !params.SKIP_QUALITY_CHECKS } }
+            steps {
+                script {
+                    timeout(time: 10, unit: 'MINUTES') {
+                        def qg = waitForQualityGate()
+                        if (qg.status != 'OK') {
+                            error "Pipeline failed due to Quality Gate: ${qg.status}"
+                        }
+                        echo "Quality Gate passed: ${qg.status}"
+                    }
+                }
+            }
+        }
+        stage('Build Application') {
+            steps {
+                echo "Building JAR package..."
+                sh 'mvn clean package -DskipTests -B'
+            }
+        }
+        stage('Containerization') {
+            steps {
+                script {
+                    echo "Building Docker image: ${env.DOCKER_IMAGE}:${env.APP_VERSION}"
+                    sh "docker build -t ${env.DOCKER_IMAGE}:${env.APP_VERSION} ."
+                }
+            }
+        }
+        stage('Scan Docker Image for Vulnerabilities') {
+            steps {
+                script {
+                    echo "Scanning Docker image for vulnerabilities using Trivy..."
+                    sh """
+                        # Install Trivy if not present
+                        if ! command -v trivy &> /dev/null; then
+                            curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh
+                        fi
+
+                        # Scan image, fail if CRITICAL or HIGH vulnerabilities found
+                        trivy image --exit-code 1 --severity CRITICAL,HIGH ${env.DOCKER_IMAGE}:${env.APP_VERSION}
+                    """
+                }
+            }
+        }
+        stage('Publish Docker Image') {
+            environment {
+                AWS_REGION   = "ap-south-1"
+                ECR_URI      = "361769585646.dkr.ecr.ap-south-1.amazonaws.com/media-content-fusioniq"
+                PROJECT_NAME = "fusioniq"
+            steps {
+                script {
+                    withCredentials([[ $class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-ecr-creds' ]]) {
+                        echo "Logging in to AWS ECR and pushing images..."
+                        sh """
+                            aws ecr get-login-password --region ${env.AWS_REGION} \
+                              | docker login --username AWS --password-stdin ${ECR_URI}
+
+                            docker tag ${env.DOCKER_IMAGE}:${env.APP_VERSION} ${ECR_URI}:${env.APP_VERSION}
+                            docker tag ${env.DOCKER_IMAGE}:${env.APP_VERSION} ${ECR_URI}:${env.APP_VERSION}-${env.BUILD_NUMBER}
+                            docker tag ${env.DOCKER_IMAGE}:${env.APP_VERSION} ${ECR_URI}:latest
+
+                            docker push ${ECR_URI}:${env.APP_VERSION}
+                            docker push ${ECR_URI}:${env.APP_VERSION}-${env.BUILD_NUMBER}
+                            docker push ${ECR_URI}:latest
+                        """
+                    }
+                }
+            }
+        }
+
+    }
+    post {
+        always {
+            echo "Cleaning up workspace..."
+            deleteDir()
+        }
+        success {
+            script { sendTeamsNotification("SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER}", "2EB886") }
+        }
+        unstable {
+            script { sendTeamsNotification("UNSTABLE: ${env.JOB_NAME} #${env.BUILD_NUMBER}", "FFA500") }
+        }
+        failure {
+            script { sendTeamsNotification("FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}", "FF0000") }
+        }
+    }
+}
+// ---------- Helper function ----------
+def sendTeamsNotification(String title, String color) {
+    withCredentials([string(credentialsId: 'teams-webhook', variable: 'TEAMS_WEBHOOK')]) {
+        sh """
+        curl -H "Content-Type: application/json" -d '{
+          "@type": "MessageCard",
+          "@context": "http://schema.org/extensions",
+          "summary": "${title}",
+          "themeColor": "${color}",
+          "title": "${title}",
+          "sections": [{
+              "facts":[
+                  {"name":"Version","value":"${env.APP_VERSION}"},
+                  {"name":"Docker Image","value":"${env.DOCKER_IMAGE}"},
+                  {"name":"Container Name","value":"${env.CONTAINER_NAME}"}
+              ],
+              "markdown":true
+          }],
+          "potentialAction": [
+              {"@type": "OpenUri","name": "View Build","targets": [{"os": "default","uri": "${env.BUILD_URL}"}]}
+          ]
+        }' "${TEAMS_WEBHOOK}"
+        """
+    }
+}
